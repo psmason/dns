@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 
+"""
+    Basic examples:
+      `dig +tries=1 +timeout=60 @localhost -p 4053 drive.google.com google.com example.com`    
+
+    CNAME example:
+      `dig +tries=1 +timeout=60 @localhost -p 4053 www.apple.com`
+"""
+
 import dnslib
 import socket
 import random
@@ -12,6 +20,9 @@ ROOT_SERVERS = {
     'B': '170.247.170.2',
     # There are more roots...    
 }
+
+LISTENING_PORT = 4053
+
 
 def get_random_root_server():
     _, address = random.choice(list(ROOT_SERVERS.items()))
@@ -61,7 +72,7 @@ def get_address_from_response(parsed_response):
 
 def query_name_server(qname, name_server_ip_address):
     query = dnslib.DNSRecord(q=dnslib.DNSQuestion(qname, dnslib.QTYPE.A))
-    # Disabling the recusion desired bit, so that this toy project
+    # Disabling the recursion desired bit, so that this toy project
     # handles recursion requirements.
     query.header.set_rd(False)
 
@@ -104,7 +115,7 @@ def resolve_name(question):
         name_server_response = query_name_server(query_name_stack[-1], current_name_server_address)
         
         if name_server_response.answer:
-            # Remove the item of work from the stack
+            # We've answered whatever work item is at the top of the stack.
             query_name_stack.pop()
             if len(query_name_stack) == 0:
                 # We're done. 
@@ -139,7 +150,7 @@ def deliver_response(socket, response_bytes, address):
 
 
 server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-server_socket.bind(('', 4053))
+server_socket.bind(('', LISTENING_PORT))
 
 print("starting server...")
 while True:
