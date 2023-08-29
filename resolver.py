@@ -4,6 +4,7 @@ import dnslib
 import socket
 import random
 import time
+import typing
 
 # https://en.wikipedia.org/wiki/Root_name_server
 ROOT_SERVERS = {
@@ -17,24 +18,45 @@ def get_random_root_server():
     return address
 
 
+# Plain-old-data type for respones from name servers.
+class NameServerResponse(typing.NamedTuple):
+    # IPv4 IP address
+    answer: str = ""
+
+    # The response provided both a delegate authority server, and its 
+    # IPv4 address
+    delegate_ip_address: str = ""
+
+    # The response provided only the name of a delegated authority server.
+    # IPv4 addresses need to be queries as followup work.
+    delegate_name: str = ""
+
+    # A CNAME answer that requires chasing.
+    cname: str = ""
+
+
 def get_address_from_response(parsed_response):
     if len(parsed_response.rr):
         # An answer is available
-        return str(parsed_response.get_a().rdata), None, None
+        answer = parsed_response.get_a()
+        if answer.rtype == dnslib.QTYPE.A:
+            return NameServerResponse(answer=str(answer.rdata))
+        elif answer.rtype == dnslib.QTYPE.CNAME:
+            return NameServerResponse(cname=str(answer.rdata))
     
     # If there no answer, pick from the authority section for the recursive, followup query.
     auth = random.choice(parsed_response.auth)
 
     # Is the nameserver's IP address provided in the additional section?
-    auth_ip_address = None
+    delegate_ip_address = None
     for ar in parsed_response.ar:
         if ar.rtype == dnslib.QTYPE.A and ar.rname == str(auth.rdata):
-            auth_ip_address = str(ar.rdata)
-    if auth_ip_address is not None:
-        return None, auth_ip_address, None
+            delegate_ip_address = str(ar.rdata)
+    if delegate_ip_address is not None:
+        return NameServerResponse(delegate_ip_address=delegate_ip_address)
     
     print("Hit a dead end. Scheduling a new root query:", str(auth.rdata))
-    return None, None, str(auth.rdata)        
+    return NameServerResponse(delegate_name=str(auth.rdata))
 
 
 def query_name_server(qname, name_server_ip_address):
@@ -60,31 +82,55 @@ def query_name_server(qname, name_server_ip_address):
     return get_address_from_response(parsed_response)
 
 
-def resolve_name(name):
+def resolve_name(question):
     # Resolution starts at a (randomly selected) root server.
-    name_server_address = get_random_root_server()
+    current_name_server_address = get_random_root_server()
 
     # A stack tracking still-required work. If recursing hits a dead-end, and 
     # additional queries are needed starting at the root, we append to the 
     # stack. 
     #
     # Once the stack is empty, we have a deliverable answer.
-    query_name_stack = [name]
+    query_name_stack = [str(question.get_qname())]
 
-    answer = None
-    while len(query_name_stack) > 0:
-        answer, name_server_address, new_root_query = query_name_server(query_name_stack[-1], name_server_address)
+    response = dnslib.DNSRecord(
+            # Bits set in the response:
+            # qr:1 - indicates a response
+            # aa:0 - indicates a non-authoritative response
+            # ra:1 - indicates the server supports recursion (this toy server is a recursive resolver)
+            dnslib.DNSHeader(qr=1,aa=0,ra=1), 
+            q=question)
+    while True:
+        name_server_response = query_name_server(query_name_stack[-1], current_name_server_address)
         
-        if new_root_query is not None:
-            query_name_stack.append(new_root_query)
-            # Updating ns address to restart resolution from a root server
-            name_server_address = get_random_root_server()
-        elif answer is not None:
+        if name_server_response.answer:
+            # Remove the item of work from the stack
             query_name_stack.pop()
-            # With top-most answer available, potentially use it as the next name server address
-            name_server_address = answer
-    
-    return answer
+            if len(query_name_stack) == 0:
+                # We're done. 
+                response.rr.append(dnslib.RR(str(question.get_qname()), rdata=dnslib.A(name_server_response.answer)))
+                return response
+            else:
+                # Keep working, using the answer as the next name server address
+                current_name_server_address = name_server_response.answer
+        elif name_server_response.delegate_name:
+            # We're still trying to answer some targeted resource name, so it stays 
+            # in the work stack. But there's an additional name server to resolve, 
+            # which needs to be resolved from the root.
+            query_name_stack.append(name_server_response.delegate_name)
+            # Updating ns address to restart resolution from a root server
+            current_name_server_address = get_random_root_server()
+        elif name_server_response.cname:
+            # CNAME records need to be reported to the client.
+            response.rr.append(dnslib.RR(query_name_stack[-1], rtype=dnslib.QTYPE.CNAME, rdata=dnslib.CNAME(name_server_response.cname)))
+            # The CNAME result means there's no further work to do for the current resource name.
+            query_name_stack.pop()
+            # But we chase down the CNAME, starting from the root. 
+            query_name_stack.append(name_server_response.cname)
+            current_name_server_address = get_random_root_server()
+        else:
+            # Keep traversing with the updating name server address
+            current_name_server_address = name_server_response.delegate_ip_address
 
 
 def deliver_response(socket, response_bytes, address):
@@ -103,14 +149,6 @@ while True:
     print("received DNS request:", parsed_message)
 
     for question in parsed_message.questions:
-        answer = resolve_name(str(question.get_qname()))
-        response = dnslib.DNSRecord(
-            # The header indicates a non-authoritative response.
-            # Bits set in the response:
-            # qr:1 - indicates a response
-            # aa:1 - indicates a non-authoritative response
-            # ra:1 - indicates the server supports recursion (which is we arrived at an answer)
-            dnslib.DNSHeader(id=parsed_message.header.id, qr=1,aa=0,ra=1),
-                        q=question,
-                        a=dnslib.RR(str(question.get_qname()),rdata=dnslib.A(answer)))
+        response = resolve_name(question)
+        response.header.id = parsed_message.header.id
         deliver_response(server_socket, response.pack(), address)
