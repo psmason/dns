@@ -66,61 +66,66 @@ def query_nameserver(question, name_server_address):
         print("retrying over TCP")
         raw_response = send(name_server_address, query.pack(), socket.SOCK_STREAM)
         parsed_response = dnslib.DNSRecord.parse(raw_response)
-    return parsed_response  
+    return parsed_response
 
 
-def fetch_dnskeys(name_server_address, question):
+def fetch_records(name_server_address, question):
     response = query_nameserver(question, name_server_address)
-    if response.get_a().rtype != dnslib.QTYPE.DNSKEY:
-        raise Exception("expected answer of type DNSKEY")
+    if response.get_a().rtype != question.qtype:
+        raise Exception("expected rtype {}, but received {}", question.qtype, response.get_a().rtype)
     rrs = []
     for rr in response.rr:
-        if rr.rtype == dnslib.QTYPE.DNSKEY:
+        if rr.rtype == question.qtype:
             rrs.append(rr)
         elif rr.rtype == dnslib.QTYPE.RRSIG:
             rrsig = rr
     return rrs, rrsig.rdata
 
 
-def fetch_a_records(name_server_address, question):
-    response = query_nameserver(question, name_server_address)
-    if response.get_a().rtype != dnslib.QTYPE.A:
-        raise Exception("expected answer of type A")
-    rrs = []
-    for rr in response.rr:
-        if rr.rtype == dnslib.QTYPE.A:
-            rrs.append(rr)
-        elif rr.rtype == dnslib.QTYPE.RRSIG:
-            rrsig = rr
-    return rrs, rrsig.rdata
-
-
-def fetch_ds(name_server_address, question):
-    response = query_nameserver(question, name_server_address)
-    if response.get_a().rtype != dnslib.QTYPE.DS:
-        raise Exception("expected answer of type DS")
-    rrs = []
-    for rr in response.rr:
-        if rr.rtype == dnslib.QTYPE.DS:
-            rrs.append(rr)
-        elif rr.rtype == dnslib.QTYPE.RRSIG:
-            rrsig = rr
-    return rrs, rrsig.rdata
-
-
-def get_zone_signing_key(dnskeys):
+def get_zone_signing_keys(dnskeys):
+    # There can be multiple zone signing keys. 
+    #
+    # From https://www.rfc-editor.org/rfc/rfc4035#section-2.1:
+    #   For each private key used to create RRSIG RRs in a zone, 
+    #   the zone SHOULD include a zone DNSKEY RR containing the 
+    #   corresponding public key.
+    keys = []
     for rr in dnskeys:
         # The zone signing key has flag field set to 256.
         # Reference: https://www.rfc-editor.org/rfc/rfc4034#section-2.1.1
         if rr.rdata.flags == 256:
-            return rr
+            keys.append(rr)
+    return keys
 
-def get_key_signing_key(dnskeys):
+
+def get_key_signing_keys(dnskeys):
+    # Similar to zone signing keys, there can be multiple key signing keys.
+    keys = []
     for rr in dnskeys:
         # The key signing key has flag field set to 257.
         # Reference: https://www.rfc-editor.org/rfc/rfc4034#section-2.1.1
         if rr.rdata.flags == 257:
-            return rr
+            keys.append(rr)
+    return keys
+
+
+def canonical_order(rrs):
+    # See https://www.rfc-editor.org/rfc/rfc4034#section-6 for how to 
+    # order canonically. 
+    #
+    # This naive implementation just does bytewise ordering in an RR's rdata.
+    packed_rrs = []
+    for rr in rrs:
+        rdata = dnslib.Buffer()
+        rr.rdata.pack(rdata)
+        packed_rrs.append(rdata.data)
+    sorted_indices = [i[0] for i in sorted(enumerate(packed_rrs), key=lambda x:x[1])]
+
+    result = []
+    for i in sorted_indices:
+        result.append(rrs[i])
+    return result
+
 
 
 def encode_name(name):
@@ -260,27 +265,51 @@ def verify_with_rsa_sha256(signing_key, rrsig, bytes_to_verify):
     rsa.verify(message=io.BytesIO(bytes_to_verify), signature=rrsig.sig, pub_key=public_key)
 
 
-def verify_data(signing_key, rrsig, rrs):
-    # https://www.iana.org/assignments/dns-sec-alg-numbers/dns-sec-alg-numbers.xhtml
-    if signing_key.protocol != 3:
-        # The protocol value must be set to 3.
-        # Reference: https://www.rfc-editor.org/rfc/rfc4034#section-2.1.2
-        raise Exception("Invalid DNSKEY: protocol not set to 3")
-        
+def verify_data(signing_keys, rrsig, rrs):
+    # From https://www.rfc-editor.org/rfc/rfc4034#section-3.1.6:
+    #    The Key Tag field contains the key tag value of the DNSKEY RR that
+    #    validates this signature, in network byte order.    
+    validating_signing_key = None
+    for signing_key in signing_keys:
+        if signing_key.rdata.protocol != 3:
+            # The protocol value must be set to 3.
+            # Reference: https://www.rfc-editor.org/rfc/rfc4034#section-2.1.2
+            raise Exception("Invalid DNSKEY: protocol not set to 3")
+        if dnskey_key_tag(signing_key.rdata) == rrsig.key_tag:
+            validating_signing_key = signing_key.rdata
+            break
+    if not validating_signing_key:
+        raise Exception("Failed to find validating signing key for RRSIG={}", rrsig.key_tag)
+
     data = bytearray()
     data.extend(build_rrsig_signing_data(rrsig))
-    data.extend(build_rrs_signing_data(rrs))
+    data.extend(build_rrs_signing_data(canonical_order(rrs)))
 
-    if signing_key.algorithm == 13:
-        verify_with_ecdsa_sha256(signing_key, rrsig, data)
-    elif signing_key.algorithm == 8:
-        verify_with_rsa_sha256(signing_key, rrsig, data)
+    # https://www.iana.org/assignments/dns-sec-alg-numbers/dns-sec-alg-numbers.xhtml.
+    if validating_signing_key.algorithm == 13:
+        verify_with_ecdsa_sha256(validating_signing_key, rrsig, data)
+    elif validating_signing_key.algorithm == 8:
+        verify_with_rsa_sha256(validating_signing_key, rrsig, data)
     else:
-        raise Exception("Unexpected verifying algorithm:", signing_key.algorithm)    
-    print("RRSIG={} and DNSKEY={} verifies the {} resource records".format(rrsig.key_tag, dnskey_key_tag(signing_key), dnslib.QTYPE[rrs[0].rtype]))
+        raise Exception("Unexpected verifying algorithm:", validating_signing_key.algorithm)    
+    print("RRSIG={} and DNSKEY={} verifies the {} resource records".format(
+        rrsig.key_tag, 
+        dnskey_key_tag(validating_signing_key), 
+        dnslib.QTYPE[rrs[0].rtype]))
 
 
-def verify_ksk_against_ds(ds, key_signing_key):
+def verify_ksk_against_ds(ds, key_signing_keys):
+    # From https://www.rfc-editor.org/rfc/rfc4034#section-5.1.1:
+    #   The Key Tag field lists the key tag of the DNSKEY RR referred to by
+    #   the DS record...
+    ksk_to_authenticate = None
+    for ksk in key_signing_keys:
+        if dnskey_key_tag(ksk.rdata) == ds.key_tag:
+            ksk_to_authenticate = ksk
+            break
+    if not ksk_to_authenticate:
+        raise Exception("Failed to find DNSKEY to authenticate for DS={}", ds.key_tag)
+
     # https://www.iana.org/assignments/ds-rr-types/ds-rr-types.xhtml
     if ds.digest_type != 2:
         raise Exception("expected DS digest type of 2: SHA256")
@@ -296,15 +325,15 @@ def verify_ksk_against_ds(ds, key_signing_key):
     #
     #  DNSKEY RDATA = Flags | Protocol | Algorithm | Public Key.
     data = bytearray()
-    data.extend(encode_name(str(key_signing_key.rname)))
+    data.extend(encode_name(str(ksk_to_authenticate.rname)))
     
     dnskey_rdata = dnslib.Buffer()
-    key_signing_key.rdata.pack(dnskey_rdata)
+    ksk_to_authenticate.rdata.pack(dnskey_rdata)
     data.extend(dnskey_rdata.data)
 
     if hashlib.sha256(data).hexdigest() != ds.digest.hex():
         raise Exception("Failed to validate against the parent DS record. SHA256 mismatch!")
-    print("DS={} verifies DNSKEY={}".format(ds.key_tag, dnskey_key_tag(key_signing_key.rdata)))
+    print("DS={} verifies DNSKEY={}".format(ds.key_tag, dnskey_key_tag(ksk_to_authenticate.rdata)))
 
 #############################################
 ### Running verification, from bottom-to-top.
@@ -314,43 +343,50 @@ def verify_ksk_against_ds(ds, key_signing_key):
 # Step 1: verifying authoritive A records about example.com
 
 # Fetching DNSKEYS from a.iana-servers.net.
-dnskeys, dnskey_rrsig = fetch_dnskeys("199.43.135.53", dnslib.DNSQuestion("example.com.", dnslib.QTYPE.DNSKEY))
+dnskeys, dnskey_rrsig = fetch_records("199.43.135.53", dnslib.DNSQuestion("example.com.", dnslib.QTYPE.DNSKEY))
 
 # Verifying zone data
-zsk = get_zone_signing_key(dnskeys)
 # Fetching A records from a.iana-servers.net.
-rrs, a_rrsig = fetch_a_records("199.43.135.53", dnslib.DNSQuestion("example.com.", dnslib.QTYPE.A))
-verify_data(zsk.rdata, a_rrsig, rrs)
+rrs, a_rrsig = fetch_records("199.43.135.53", dnslib.DNSQuestion("example.com.", dnslib.QTYPE.A))
+verify_data(get_zone_signing_keys(dnskeys), a_rrsig, rrs)
 
 # Verifying key data
-ksk = get_key_signing_key(dnskeys)
-verify_data(ksk.rdata, dnskey_rrsig, dnskeys)
+verify_data(get_key_signing_keys(dnskeys), dnskey_rrsig, dnskeys)
 
 ################################################################
 # Step 2: verifying information from the parent top level domain
 
 # Fetch the parent's DS record about "example.com", from a.gtld-servers.net.
-tld_ds, tld_ds_rrsig = fetch_ds("192.5.6.30", dnslib.DNSQuestion("example.com.", dnslib.QTYPE.DS))
-verify_ksk_against_ds(tld_ds[0].rdata, ksk)
+tld_ds, tld_ds_rrsig = fetch_records("192.5.6.30", dnslib.DNSQuestion("example.com.", dnslib.QTYPE.DS))
+verify_ksk_against_ds(tld_ds[0].rdata, get_key_signing_keys(dnskeys))
 
 # Verify the parent's DS records against the zone signing key.
-tld_dnskeys, tld_dnskey_rrsig = fetch_dnskeys("192.5.6.30", dnslib.DNSQuestion("com.", dnslib.QTYPE.DNSKEY))
-tld_zsk = get_zone_signing_key(tld_dnskeys) 
-verify_data(tld_zsk.rdata, tld_ds_rrsig, tld_ds)
+tld_dnskeys, tld_dnskey_rrsig = fetch_records("192.5.6.30", dnslib.DNSQuestion("com.", dnslib.QTYPE.DNSKEY))
+verify_data(get_zone_signing_keys(tld_dnskeys), tld_ds_rrsig, tld_ds)
 
 # Verifying DNSKEYS in the parent com. top level domain
-tld_ksk = get_key_signing_key(tld_dnskeys)
-verify_data(tld_ksk.rdata, tld_dnskey_rrsig, tld_dnskeys)
+verify_data(get_key_signing_keys(tld_dnskeys), tld_dnskey_rrsig, tld_dnskeys)
 
 ####################################################################
 # Step 3: verifying information about the top level domain from root
 
 # Fetch the root DS record about "com", from a.root-servers.net.
-root_ds, root_ds_rrsig = fetch_ds("198.41.0.4", dnslib.DNSQuestion("com.", dnslib.QTYPE.DS))
-verify_ksk_against_ds(root_ds[0].rdata, tld_ksk)
+root_ds, root_ds_rrsig = fetch_records("198.41.0.4", dnslib.DNSQuestion("com.", dnslib.QTYPE.DS))
+verify_ksk_against_ds(root_ds[0].rdata, get_key_signing_keys(tld_dnskeys))
 
 # Verify the root's DS records against the zone signing key.
-root_dnskeys, root_dnskey_rrsig = fetch_dnskeys("198.41.0.4", dnslib.DNSQuestion(".", dnslib.QTYPE.DNSKEY))
-#root_zsk = get_zone_signing_key(root_dnskeys)
-#verify_data(root_zsk.rdata, root_ds_rrsig, root_ds)
-verify_data(root_dnskeys[1].rdata, root_ds_rrsig, root_ds)
+root_dnskeys, root_dnskey_rrsig = fetch_records("198.41.0.4", dnslib.DNSQuestion(".", dnslib.QTYPE.DNSKEY))
+verify_data(get_zone_signing_keys(root_dnskeys), root_ds_rrsig, root_ds)
+
+# Verify the DNSKEYS in root.
+verify_data(get_key_signing_keys(root_dnskeys), root_dnskey_rrsig, root_dnskeys)
+
+######################################################################
+# Step 4: verifying root key signing key against the trust anchor's DS
+
+# Hardcoding the latest DS record from  http://data.iana.org/root-anchors/root-anchors.xml.
+trust_anchor = dnslib.DS(key_tag=20326, 
+                         algorithm=8, 
+                         digest_type=2, 
+                         digest=bytes.fromhex("E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D"))
+verify_ksk_against_ds(trust_anchor, get_key_signing_keys(root_dnskeys))
